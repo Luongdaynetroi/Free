@@ -2,17 +2,13 @@
 -- DucLuongg FixLag™ — Cement Mode (Full edition)
 -- - UltraLow mặc định (xi măng)
 -- - Giữ đảo / quái / UI — chỉ giảm hiệu ứng nặng + đồ họa
--- - Toggle bằng phím (mặc định F)
--- - Watermark notify: "DucLuongg FixLag™"
 -- ======================================================
 
--- ======= CONFIG (SỬA Ở ĐẦU NẾU CẦN) =======
-local CONFIG = {
-    MODE = "UltraLow",           -- "UltraLow" / "Medium" / "High"
-    LOCK_FPS = 120,              -- setfpscap nếu exploit hỗ trợ
-    TOGGLE_KEY = Enum.KeyCode.F, -- phím bật/tắt
-    SHOW_NOTIFICATION = true,    -- Set false để tắt noti
-    KEEP_UI = true,              -- không động tới GUI
+-- ======= CONFIG (CUSTOM BẰNG _G) =======
+local MODE = (_G.DucMode and tostring(_G.DucMode)) or "UltraLow" -- "UltraLow" / "Medium" / "High"
+local FPS  = tonumber(_G.DucFPS) or 120
+local SHOW_NOTIFICATION = (_G.DucNotify ~= false)
+    KEEP_UI = true,              
     CEMENT_TRANSPARENCY = 0.45,  -- decal/texture transparency (xi măng look)
     IGNORE_LIST = {},            -- places to ignore (workspace.Map, etc)
     SPAWN_DELAY = 0.6,           -- delay khi xử lý descendant mới
