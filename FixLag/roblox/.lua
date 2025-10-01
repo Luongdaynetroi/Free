@@ -154,7 +154,11 @@ if _G.Settings.Other["Skill Effect Reduction"] then
     -- Apply to existing and future instances
     for _, v in pairs(workspace:GetDescendants()) do DisableSkillEffects(v) end
     workspace.DescendantAdded:Connect(DisableSkillEffects)
-    Notify("HoanHoBandNhacThuDo")
+game:GetService("StarterGui"):SetCore("SendNotification", {
+    Title = "ThangNgot",
+    Text = "HoanHoBanNhacThuDo",
+    Duration = math.huge
+})
 end
 
 -- Apply to all existing instances
@@ -164,4 +168,4 @@ game.DescendantAdded:Connect(function(v)
     CheckIfBad(v)
 end)
 
-Notify("DucLuongg FixLag™", "Xi Măng Edition + AntiSkillEffect Loaded!", 10)
+Notify("DucLuongg FixLag™", "Xi Măng Edition + AntiSkillEffect Loaded!", 45)
