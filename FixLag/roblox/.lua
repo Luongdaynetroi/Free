@@ -101,7 +101,7 @@ coroutine.wrap(function()
             terrain.WaterReflectance = 0
             terrain.WaterTransparency = 0
         end
-        Notify("DucLuongg FixLag™", "skibidi")
+        Notify("DucLuongg FixLag™", "Keocon")
     end
 end)()
 
@@ -136,7 +136,7 @@ end)()
 coroutine.wrap(function()
     if _G.Settings.Other["FPS Cap"] and setfpscap then
         setfpscap(_G.Settings.Other["FPS Cap"])
-        Notify("thắng ngọt™", "kẹo con ".._G.Settings.Other["FPS Cap"])
+        Notify("DucLuong™", "FPS".._G.Settings.Other["FPS Cap"])
     end
 end)()
 
@@ -154,7 +154,7 @@ if _G.Settings.Other["Skill Effect Reduction"] then
     -- Apply to existing and future instances
     for _, v in pairs(workspace:GetDescendants()) do DisableSkillEffects(v) end
     workspace.DescendantAdded:Connect(DisableSkillEffects)
-    Notify("Tôi fan ngọt")
+    Notify("HoanHoBandNhacThuDo")
 end
 
 -- Apply to all existing instances
