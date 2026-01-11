@@ -1,0 +1,111 @@
+--[[ 
+    DucLuongg FixLag™ 20%
+    Xi Măng Sáng | Không Xóa Map / Quái / UI
+    Client-side only
+]]
+
+local Lighting = game:GetService("Lighting")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+-- ===============================
+-- 1. LIGHTING (Giữ đẹp, giảm lag)
+-- ===============================
+Lighting.GlobalShadows = true
+Lighting.ShadowSoftness = 0.6
+Lighting.Brightness = 2.2
+Lighting.ExposureCompensation = 0.15
+Lighting.EnvironmentDiffuseScale = 0.5
+Lighting.EnvironmentSpecularScale = 0.5
+Lighting.OutdoorAmbient = Color3.fromRGB(120,120,120)
+Lighting.Ambient = Color3.fromRGB(90,90,90)
+Lighting.ColorShift_Top = Color3.fromRGB(255,255,255)
+Lighting.ColorShift_Bottom = Color3.fromRGB(180,180,180)
+
+-- Xóa mấy effect nặng nhưng vẫn giữ sáng
+for _,v in pairs(Lighting:GetChildren()) do
+    if v:IsA("BloomEffect") or v:IsA("SunRaysEffect") then
+        v:Destroy()
+    elseif v:IsA("BlurEffect") or v:IsA("DepthOfFieldEffect") then
+        v.Enabled = false
+    end
+end
+
+-- ===============================
+-- 2. MATERIAL & PART OPTIMIZE
+-- ===============================
+for _,v in pairs(workspace:GetDescendants()) do
+    if v:IsA("BasePart") then
+        v.Reflectance = 0
+        v.CastShadow = true
+
+        if v.Material == Enum.Material.Grass
+        or v.Material == Enum.Material.Fabric
+        or v.Material == Enum.Material.Foil then
+            v.Material = Enum.Material.SmoothPlastic
+        end
+    end
+end
+
+-- ===============================
+-- 3. SKILL EFFECT REDUCTION (NHẸ)
+-- ===============================
+local function ReduceSkillEffect(obj)
+    if obj:IsA("ParticleEmitter") then
+        obj.Rate = math.min(obj.Rate, 25)
+        obj.LightEmission = math.min(obj.LightEmission, 0.6)
+    elseif obj:IsA("Trail") then
+        obj.Enabled = false
+    elseif obj:IsA("Explosion") then
+        obj.BlastPressure = 0
+        obj.BlastRadius = math.min(obj.BlastRadius, 6)
+    end
+end
+
+for _,v in pairs(workspace:GetDescendants()) do
+    ReduceSkillEffect(v)
+end
+
+workspace.DescendantAdded:Connect(function(v)
+    task.wait()
+    ReduceSkillEffect(v)
+end)
+
+-- ===============================
+-- 4. CAMERA SHAKE REDUCTION
+-- ===============================
+local cam = workspace.CurrentCamera
+RunService.RenderStepped:Connect(function()
+    cam.CFrame = cam.CFrame:Lerp(cam.CFrame, 0.85)
+end)
+
+-- ===============================
+-- 5. CHARACTER OPTIMIZE (KHÔNG MẤT HITBOX)
+-- ===============================
+local function OptimizeChar(char)
+    for _,v in pairs(char:GetDescendants()) do
+        if v:IsA("Accessory") then
+            v:Destroy()
+        elseif v:IsA("BasePart") then
+            v.Material = Enum.Material.SmoothPlastic
+        end
+    end
+end
+
+if player.Character then
+    OptimizeChar(player.Character)
+end
+
+player.CharacterAdded:Connect(OptimizeChar)
+
+-- ===============================
+-- 6. NOTIFY
+-- ===============================
+pcall(function()
+    game.StarterGui:SetCore("SendNotification", {
+        Title = "DucLuongg FixLag™",
+        Text = "FixLag 20% | Xi Măng Sáng | Skill Mượt",
+        Duration = 10
+    })
+end)
