@@ -1,0 +1,149 @@
+-- DucLuongg FixLag™ — 75% Edition
+-- Dán chạy client-side. Thêm object cần bảo vệ vào _G.Ignore trước khi chạy.
+
+if not _G.Ignore then _G.Ignore = {} end
+local CONFIG = {
+    NAME = "FixLag75",
+    LOCK_FPS = 120,
+    WATER_TWEAK = true,
+    AGGRESSIVE_PARTICLE = true,
+    LOWER_MESHQUALITY = true,
+    TONE_DOWN_POST = true,
+    PROTECT_PLAYERS = true,
+    PROTECT_NPCS_WITH_HUMANOID = true,
+    DESTROY_NONCRITICAL = false, -- nếu true sẽ destroy một số decorative heavy objects (không khuyến nghị)
+}
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local MaterialService = game:GetService("MaterialService")
+local StarterGui = game:GetService("StarterGui")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+local function notify(t)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {Title = "DucLuongg FixLag75", Text = t, Duration = 5})
+    end)
+end
+
+local function isIgnored(inst)
+    if not inst then return false end
+    for _,v in pairs(_G.Ignore) do
+        if v and inst:IsDescendantOf(v) then return true end
+    end
+    return false
+end
+
+local function ancestorHasHumanoid(inst)
+    local a = inst
+    while a and a.Parent do
+        if a:FindFirstChildOfClass and a:FindFirstChildOfClass("Humanoid") then return true end
+        a = a.Parent
+    end
+    return false
+end
+
+local function protected(inst)
+    if not inst then return true end
+    if isIgnored(inst) then return true end
+    if CONFIG.PROTECT_PLAYERS and inst:IsDescendantOf(Players) then return true end
+    if CONFIG.PROTECT_NPCS_WITH_HUMANOID and ancestorHasHumanoid(inst) then return true end
+    if inst:IsDescendantOf(game:GetService("CoreGui")) then return true end
+    if LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui") and inst:IsDescendantOf(LocalPlayer.PlayerGui) then return true end
+    return false
+end
+
+local function tweakInstance(inst)
+    if not inst or not inst.Parent then return end
+    if protected(inst) then return end
+
+    -- MeshParts / Parts
+    if inst:IsA("MeshPart") then
+        pcall(function()
+            inst.RenderFidelity = Enum.RenderFidelity.Performance
+            inst.Material = Enum.Material.SmoothPlastic
+            inst.CastShadow = false
+            inst.Reflectance = 0
+        end)
+    elseif inst:IsA("BasePart") then
+        pcall(function()
+            inst.Material = Enum.Material.SmoothPlastic
+            inst.Reflectance = 0
+            inst.CastShadow = false
+        end)
+    end
+
+    -- Particles & Trails
+    if CONFIG.AGGRESSIVE_PARTICLE then
+        if inst:IsA("ParticleEmitter") then
+            pcall(function()
+                inst.Rate = 0
+                inst.Lifetime = NumberRange.new(0.05)
+                inst.Speed = NumberRange.new(0)
+                inst.Enabled = false
+            end)
+        elseif inst:IsA("Trail") then
+            pcall(function() inst.Enabled = false end)
+        elseif inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles") then
+            pcall(function() inst.Enabled = false end)
+        elseif inst:IsA("Explosion") then
+            pcall(function() inst.BlastPressure = 0; inst.BlastRadius = math.min(inst.BlastRadius or 8,6); inst.Visible = false end)
+        end
+    end
+
+    -- Decal / Texture economy (subtle)
+    if inst:IsA("Decal") or inst:IsA("Texture") then
+        pcall(function()
+            if inst.Transparency and inst.Transparency < 0.15 then inst.Transparency = 0.12 end
+        end)
+    end
+
+    -- PostEffects tone down
+    if CONFIG.TONE_DOWN_POST and inst:IsA("PostEffect") then
+        pcall(function()
+            if inst.ClassName == "BloomEffect" then inst.Intensity = math.min(inst.Intensity or 0.8, 0.6) end
+            if inst.ClassName == "SunRaysEffect" then inst.Intensity = math.min(inst.Intensity or 0.2, 0.12) end
+            if inst.ClassName == "DepthOfFieldEffect" or inst.ClassName == "BlurEffect" then inst.Enabled = false end
+        end)
+    end
+
+    -- Optionally destroy only decorative heavy objects (careful)
+    if CONFIG.DESTROY_NONCRITICAL then
+        if inst.Name:match("Decal") or inst.Name:match("Decoration") then
+            pcall(function() inst:Destroy() end)
+        end
+    end
+end
+
+-- apply to existing and future
+for _,v in pairs(workspace:GetDescendants()) do pcall(tweakInstance,v) end
+Workspace.DescendantAdded:Connect(function(v) task.wait(0.04); pcall(tweakInstance,v) end)
+
+-- rendering global
+pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level02 end)
+pcall(function() Lighting.GlobalShadows = false; Lighting.ShadowSoftness = 0 end)
+if CONFIG.WATER_TWEAK then
+    pcall(function()
+        local t = workspace:FindFirstChildOfClass("Terrain")
+        if t then
+            t.WaterWaveSize = 0; t.WaterWaveSpeed = 0; t.WaterReflectance = 0; t.WaterTransparency = 0
+            if sethiddenproperty then pcall(sethiddenproperty, t, "Decoration", false) end
+        end
+    end)
+end
+
+-- materials fallback
+pcall(function()
+    for _,m in pairs(MaterialService:GetChildren()) do pcall(function() m:Destroy() end) end
+    pcall(function() MaterialService.Use2022Materials = false end)
+end)
+
+-- setfpscap if available
+if CONFIG.LOCK_FPS and type(CONFIG.LOCK_FPS) == "number" and setfpscap then
+    pcall(function() setfpscap(CONFIG.LOCK_FPS) end)
+end
+
+notify("FixLag 75% applied — giữ đảo/quái/UI. Thêm vào _G.Ignore nếu muốn bảo vệ object.", 6)
+print("DucLuongg FixLag75 loaded.")
