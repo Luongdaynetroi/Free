@@ -1,28 +1,30 @@
 -- ==========================
--- FIXLAG 100% - AUTO RUN
--- Max FPS, destructive (destroy decals/textures), minimal UI preserved
--- Paste vào LocalScript / executor (client-side)
+-- FIXLAG FARMER MODE - AUTO RUN
+-- Non-destructive as much as possible: set transparency/color to grayscale, disable heavy particles
+-- Keep UI, NPC (Humanoid), quest systems
 -- ==========================
 
 -- CONFIG
-local BATCH_SIZE = 60       -- số instance xử lý mỗi lần (giảm để tránh đơ)
-local SLEEP_TIME = 0.012    -- thời gian chờ giữa các batch
+local BATCH_SIZE = 90
+local SLEEP_TIME = 0.015
+local TARGET_DECAL_TRANSPARENCY = 1.0  -- decal -> fully invisible (but not destroyed)
+local TARGET_PART_COLOR = Color3.fromRGB(160,160,160) -- neutral gray
+local PARTICLE_RATE_RATIO = 0.18  -- reduce particle rates to ~18%
 local DEBUG = true
 
 local Players = game:GetService("Players")
-local Lighting = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CollectionService = game:GetService("CollectionService")
 local player = Players.LocalPlayer
 
--- backup store (note: destroyed decals/textures can't be restored)
-_G.__fix100_backup = _G.__fix100_backup or {}
-local backup = _G.__fix100_backup
+_G.__fixFarmer_backup = _G.__fixFarmer_backup or {}
+local backup = _G.__fixFarmer_backup
 
 local function log(...)
     if not DEBUG then return end
-    pcall(function() print("[Fix100] ", ...) end)
+    pcall(function() print("[FixFarmer] ", ...) end)
 end
 
 local function safe(fn, ...)
@@ -30,48 +32,30 @@ local function safe(fn, ...)
     return ok, res
 end
 
--- Heuristics to decide whether to preserve an instance
-local function isWhitelisted(inst)
-    if not inst or not inst:IsA("Instance") then return false end
+-- whitelist heuristic (stronger than Fix100: keep NPCs, keep anything with "Quest" in name)
+local function isFarmWhitelist(inst)
+    if not inst then return false end
+    if inst:IsDescendantOf(player:FindFirstChild("PlayerGui") or {}) then return true end
+    if player.Character and inst:IsDescendantOf(player.Character) then return true end
+    if inst:IsDescendantOf(ReplicatedStorage) then return true end
 
-    -- 1) Always preserve PlayerGui (game HUD / menus)
-    if inst:IsDescendantOf(player:FindFirstChild("PlayerGui") or {}) then
-        return true
-    end
-
-    -- 2) Preserve CoreGui-related (can't modify CoreGui safely)
-    -- (we don't try to modify CoreGui at all)
-
-    -- 3) Preserve player's character and descendants
-    if player.Character and inst:IsDescendantOf(player.Character) then
-        return true
-    end
-
-    -- 4) Preserve objects in ReplicatedStorage (assets), avoid touching
-    if inst:IsDescendantOf(ReplicatedStorage) then
-        return true
-    end
-
-    -- 5) Preserve obvious NPCs / enemies: Models that have Humanoid or HumanoidRootPart
     local model = inst
-    while model and not model:IsA("Model") do
-        model = model.Parent
-    end
+    while model and not model:IsA("Model") do model = model.Parent end
     if model and model:IsA("Model") then
-        if model:FindFirstChildOfClass("Humanoid") or model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("PrimaryPart") then
+        if model:FindFirstChildOfClass("Humanoid") or model:FindFirstChild("HumanoidRootPart") then
+            return true
+        end
+        local nm = tostring(model.Name):lower()
+        if nm:find("npc") or nm:find("enemy") or nm:find("mob") or nm:find("boss") or nm:find("quest") then
             return true
         end
     end
 
-    -- 6) Preserve instances tagged via CollectionService "Keep" if present (devs sometimes tag important things)
-    if CollectionService and CollectionService:HasTag(inst, "Keep") then
-        return true
-    end
+    if CollectionService and CollectionService:HasTag(inst, "Keep") then return true end
 
-    -- 7) Preserve GUIs attached to world that look like essential: BillboardGui or SurfaceGui with Name containing "Quest" or "UI"
     if inst:IsA("BillboardGui") or inst:IsA("SurfaceGui") then
         local name = tostring(inst.Name):lower()
-        if name:find("quest") or name:find("ui") or name:find("hud") or name:find("health") then
+        if name:find("quest") or name:find("ui") or name:find("hud") or name:find("target") then
             return true
         end
     end
@@ -79,7 +63,7 @@ local function isWhitelisted(inst)
     return false
 end
 
--- Store backup for restorable props (best-effort)
+-- store backup
 local function storeBackup(inst, key, value)
     if not inst then return end
     local id = tostring(inst:GetDebugId and inst:GetDebugId() or inst:GetFullName())
@@ -87,76 +71,90 @@ local function storeBackup(inst, key, value)
     backup[id][key] = value
 end
 
--- Aggressive apply to a single instance (destructive where needed)
-local function applyAggressive(inst)
+-- Apply farmer-mode changes (non-destructive where possible)
+local function applyFarmer(inst)
     if not inst or not inst.Parent then return end
-    if isWhitelisted(inst) then return end
+    if isFarmWhitelist(inst) then return end
 
-    -- Decals / Textures / SurfaceAppearance -> destroy (irreversible)
-    if inst:IsA("Decal") or inst:IsA("Texture") then
+    -- Particle emitters -> reduce rate (backup)
+    if inst:IsA("ParticleEmitter") then
         safe(function()
-            storeBackup(inst, "exists", true)
-            inst:Destroy()
+            storeBackup(inst, "Rate", inst.Rate)
+            storeBackup(inst, "Enabled", inst.Enabled)
+            -- attempt to set Rate to small ratio
+            local ok = pcall(function()
+                inst.Rate = (inst.Rate or 1) * PARTICLE_RATE_RATIO
+            end)
+            if not ok then
+                pcall(function() inst.Enabled = false end)
+            end
         end)
         return
     end
-    if inst:IsA("SurfaceAppearance") then
-        safe(function()
-            storeBackup(inst, "exists", true)
-            inst:Destroy()
-        end)
-        return
-    end
 
-    -- Particle-type visuals -> disable
-    if inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") then
+    -- Trail / Beam -> reduce / keep enabled but attempt to shorten appearance
+    if inst:IsA("Trail") or inst:IsA("Beam") then
         safe(function()
             storeBackup(inst, "Enabled", inst.Enabled)
-            inst.Enabled = false
+            -- try to nudge lifetime-relevant properties if exist (best-effort)
+            pcall(function() inst.Enabled = false end) -- safer to disable for performance
         end)
         return
     end
 
-    -- SpecialMesh: try to remove texture ids / reduce complexity
-    if inst:IsA("SpecialMesh") then
+    -- Decal / Texture -> make invisible (do not destroy)
+    if inst:IsA("Decal") or inst:IsA("Texture") then
         safe(function()
-            storeBackup(inst, "MeshType", inst.MeshType)
-            storeBackup(inst, "MeshId", inst.MeshId)
-            storeBackup(inst, "TextureId", inst.TextureId)
-            -- remove texture to reduce draw (note: may change visuals)
-            inst.TextureId = ""
-            -- keep mesh type but could optionally set to FileMesh none; leave for safety
+            storeBackup(inst, "Transparency", inst.Transparency)
+            inst.Transparency = math.max(inst.Transparency or 0, TARGET_DECAL_TRANSPARENCY)
         end)
         return
     end
 
-    -- MeshPart / UnionOperation: simplify by setting material & transparency
-    if inst:IsA("MeshPart") or inst:IsA("UnionOperation") or inst:IsA("Part") or inst:IsA("BasePart") then
+    -- SurfaceAppearance: remove maps if possible (best-effort, non-destroy)
+    if inst:IsA("SurfaceAppearance") then
         safe(function()
-            -- skip parts in player's character
+            storeBackup(inst, "ColorMap", inst.ColorMap)
+            storeBackup(inst, "NormalMap", inst.NormalMap)
+            -- try to clear references (non-destructive), some executors may block property writes
+            pcall(function() inst.ColorMap = "" end)
+            pcall(function() inst.NormalMap = "" end)
+        end)
+        return
+    end
+
+    -- BasePart: set to gray + plastic (keep collision/hitbox)
+    if inst:IsA("BasePart") then
+        safe(function()
             if player.Character and inst:IsDescendantOf(player.Character) then return end
-            -- backup
             storeBackup(inst, "Material", inst.Material)
             storeBackup(inst, "Color", inst.Color)
-            storeBackup(inst, "Transparency", inst.Transparency)
             storeBackup(inst, "Reflectance", inst.Reflectance)
-            -- apply cheap look
+            storeBackup(inst, "Transparency", inst.Transparency)
             inst.Material = Enum.Material.Plastic
-            inst.Color = Color3.fromRGB(128,128,128)
+            inst.Color = TARGET_PART_COLOR
             inst.Reflectance = 0
-            inst.Transparency = 0 -- keep visible for collision/hitbox
+            -- keep Transparency as-is (so invisible gates / triggers remain)
         end)
         return
     end
 
-    -- Surface GUI / Billboard GUI that are not whitelisted: reduce adornments
+    -- SpecialMesh: clear textureId
+    if inst:IsA("SpecialMesh") then
+        safe(function()
+            storeBackup(inst, "TextureId", inst.TextureId)
+            pcall(function() inst.TextureId = "" end)
+        end)
+        return
+    end
+
+    -- GUI-like attachments in world: hide heavy images
     if inst:IsA("BillboardGui") or inst:IsA("SurfaceGui") then
         safe(function()
-            -- We try to hide heavy children (ImageLabel/ImageButton)
             for _,c in ipairs(inst:GetDescendants()) do
                 if c:IsA("ImageLabel") or c:IsA("ImageButton") or c:IsA("VideoFrame") then
-                    pcall(function() c.Image = "" end)
-                    pcall(function() if c:IsA("GuiObject") then c.Visible = false end end)
+                    storeBackup(c, "Visible", c.Visible)
+                    pcall(function() c.Visible = false end)
                 end
             end
         end)
@@ -164,7 +162,7 @@ local function applyAggressive(inst)
     end
 end
 
--- Batch processing (to avoid freeze)
+-- batch processor
 local function batchProcess(list, fn, batchSize, sleepTime)
     batchSize = batchSize or BATCH_SIZE
     sleepTime = sleepTime or SLEEP_TIME
@@ -181,70 +179,73 @@ local function batchProcess(list, fn, batchSize, sleepTime)
     end
 end
 
--- Lighting + rendering clamp
-local function clampLightingAndRender()
+-- Lighting + color correction to grayscale
+local function applyLightingAndCC()
     safe(function()
+        -- Add ColorCorrectionEffect if not present
+        local existing = Lighting:FindFirstChild("FixFarmerColorCorrection")
+        if not existing then
+            local cc = Instance.new("ColorCorrectionEffect")
+            cc.Name = "FixFarmerColorCorrection"
+            cc.Saturation = -1
+            cc.Contrast = 0.05
+            cc.Brightness = 0
+            cc.Parent = Lighting
+            storeBackup(Lighting, "HadColorCorrection", true)
+        end
+        -- adjust lighting to be simple
         storeBackup(Lighting, "GlobalShadows", Lighting.GlobalShadows)
         storeBackup(Lighting, "Brightness", Lighting.Brightness)
-        storeBackup(Lighting, "EnvironmentDiffuseScale", Lighting.EnvironmentDiffuseScale)
-        storeBackup(Lighting, "EnvironmentSpecularScale", Lighting.EnvironmentSpecularScale)
         Lighting.GlobalShadows = false
-        Lighting.Brightness = 0.4
-        Lighting.EnvironmentDiffuseScale = 0
-        Lighting.EnvironmentSpecularScale = 0
-        Lighting.FogStart = 1e9
-        Lighting.FogEnd = 1e9
+        Lighting.Brightness = math.max(0.7, Lighting.Brightness * 0.9)
     end)
     safe(function()
         if settings and settings().Rendering then
             storeBackup(settings().Rendering, "QualityLevel", settings().Rendering.QualityLevel)
-            -- set to lowest allowed (may be blocked)
-            settings().Rendering.QualityLevel = 1
+            settings().Rendering.QualityLevel = math.clamp(7, 1, 21) -- moderate low
         end
     end)
 end
 
--- apply to current workspace
-log("Starting Fix100 pass...")
+-- run pass
+log("Starting Farmer Mode pass...")
 local all = Workspace:GetDescendants()
-batchProcess(all, applyAggressive)
-clampLightingAndRender()
+batchProcess(all, applyFarmer)
+applyLightingAndCC()
 
--- Keep effect on new objects (DescendantAdded)
-if _G.__fix100_conn then
-    pcall(function() _G.__fix100_conn:Disconnect() end)
+-- keep effect on new objects
+if _G.__fixFarmer_conn then
+    pcall(function() _G.__fixFarmer_conn:Disconnect() end)
 end
-_G.__fix100_conn = Workspace.DescendantAdded:Connect(function(inst)
-    -- tiny delay to let object initialize
-    task.wait(0.02)
-    if inst and inst.Parent then
-        pcall(function() applyAggressive(inst) end)
-    end
+_G.__fixFarmer_conn = Workspace.DescendantAdded:Connect(function(inst)
+    task.wait(0.03)
+    pcall(function() applyFarmer(inst) end)
 end)
 
--- Restore helper (best-effort). Note: destroyed Decal/Texture cannot be recovered by this restore.
-_G.__fix100_restore = function()
+-- restore helper
+_G.__fixFarmer_restore = function()
     pcall(function()
-        if _G.__fix100_conn then
-            _G.__fix100_conn:Disconnect()
-            _G.__fix100_conn = nil
+        if _G.__fixFarmer_conn then
+            _G.__fixFarmer_conn:Disconnect()
+            _G.__fixFarmer_conn = nil
         end
         for id,info in pairs(backup) do
             local inst = info.instRef
             if inst and inst.Parent then
                 pcall(function()
-                    if info.Enabled ~= nil and inst:IsA("ParticleEmitter") then inst.Enabled = info.Enabled end
-                    if info.Material and inst:IsA("BasePart") then inst.Material = info.Material end
+                    if info.Rate and inst:IsA("ParticleEmitter") then inst.Rate = info.Rate end
+                    if info.Enabled ~= nil and (inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam")) then inst.Enabled = info.Enabled end
+                    if info.Transparency and inst:IsA("Decal") then inst.Transparency = info.Transparency end
                     if info.Color and inst:IsA("BasePart") then inst.Color = info.Color end
-                    if info.Transparency and inst:IsA("BasePart") then inst.Transparency = info.Transparency end
-                    if info.Reflectance and inst:IsA("BasePart") then inst.Reflectance = info.Reflectance end
-                    if info.MeshId and inst:IsA("SpecialMesh") then inst.MeshId = info.MeshId end
+                    if info.Material and inst:IsA("BasePart") then inst.Material = info.Material end
                     if info.TextureId and inst:IsA("SpecialMesh") then inst.TextureId = info.TextureId end
-                    -- many destroyed decals/textures cannot be restored
+                    if info.Visible ~= nil and inst:IsA("GuiObject") then inst.Visible = info.Visible end
                 end)
             end
         end
-        -- restore lighting
+        -- remove color correction
+        pcall(function() local cc = Lighting:FindFirstChild("FixFarmerColorCorrection") if cc then cc:Destroy() end end)
+        -- restore lighting fields
         pcall(function()
             if backup[tostring(Lighting)] and backup[tostring(Lighting)].Brightness then
                 Lighting.Brightness = backup[tostring(Lighting)].Brightness
@@ -257,7 +258,7 @@ _G.__fix100_restore = function()
             end
         end)
     end)
-    log("Restore attempted (best-effort). Note: destroyed decals/textures cannot be recovered.")
+    log("Farmer Mode restore attempted (best-effort).")
 end
 
-log("Fix100 applied. To attempt restore, call: _G.__fix100_restore()")
+log("FixFarmer applied. To restore, call: _G.__fixFarmer_restore()")
