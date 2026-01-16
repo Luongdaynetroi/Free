@@ -1,311 +1,263 @@
---========================================================
--- DucLuongg Farm-Fix™ — "Dân Cày" Edition
--- Giữ UI + Quái/NPC + Hệ thống. Xóa đảo, decor, effect nặng.
--- Chạy client-side (executor / loadstring).
--- Trước khi chạy: thêm object quan trọng vào _G.Ignore = {workspace.Map, workspace.IslandA}
---========================================================
+-- ==========================
+-- FIXLAG 100% - AUTO RUN
+-- Max FPS, destructive (destroy decals/textures), minimal UI preserved
+-- Paste vào LocalScript / executor (client-side)
+-- ==========================
 
--- ===== CONFIG (SỬA nếu muốn)
-if not _G.Ignore then _G.Ignore = {} end   -- những Instance hoặc Models bạn muốn bảo vệ (để tránh bị xóa)
-local CFG = {
-    NAME = "DucLuongg Farm-Fix",
-    NOTIFY = true,            -- hiện notification khi load
-    LOG = false,              -- warn() nhiều hơn
-    DESTROY_ISLANDS = true,   -- có xóa islands/large models ko
-    ISLAND_MIN_VOLUME = 20000,-- threshold để đánh dấu "đảo" (tăng nếu map lớn)
-    SIMPLIFY_ONLY = false,    -- nếu true thì không destroy island mà chỉ rút gọn (mesh->blank, texture->blank)
-    DISABLE_PARTICLES = true, -- tắt particle/trail/sparkles
-    MINIMIZE_POST = true,     -- disable bloom/sun/blur nếu có
-    SET_MATERIAL_PLASTIC = true, -- force các part về Plastic
-    SET_RENDERFIDELITY = true, -- set MeshPart.RenderFidelity = Performance
-    SAFE_PROTECT_HUMANOID = true, -- không động vào models có Humanoid
-}
+-- CONFIG
+local BATCH_SIZE = 60       -- số instance xử lý mỗi lần (giảm để tránh đơ)
+local SLEEP_TIME = 0.012    -- thời gian chờ giữa các batch
+local DEBUG = true
 
--- ===== services
 local Players = game:GetService("Players")
-local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
-local StarterGui = game:GetService("StarterGui")
-local MaterialService = game:GetService("MaterialService")
-local RunService = game:GetService("RunService")
-local LocalPlayer = Players.LocalPlayer
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local player = Players.LocalPlayer
 
--- ===== helpers
-local function notify(txt, dur)
-    if CFG.NOTIFY then
-        pcall(function()
-            StarterGui:SetCore("SendNotification", {Title = CFG.NAME, Text = txt, Duration = dur or 4})
-        end)
+-- backup store (note: destroyed decals/textures can't be restored)
+_G.__fix100_backup = _G.__fix100_backup or {}
+local backup = _G.__fix100_backup
+
+local function log(...)
+    if not DEBUG then return end
+    pcall(function() print("[Fix100] ", ...) end)
+end
+
+local function safe(fn, ...)
+    local ok, res = pcall(fn, ...)
+    return ok, res
+end
+
+-- Heuristics to decide whether to preserve an instance
+local function isWhitelisted(inst)
+    if not inst or not inst:IsA("Instance") then return false end
+
+    -- 1) Always preserve PlayerGui (game HUD / menus)
+    if inst:IsDescendantOf(player:FindFirstChild("PlayerGui") or {}) then
+        return true
     end
-    if CFG.LOG then warn("[Farm-Fix] "..tostring(txt)) end
-end
 
-local function isInIgnore(inst)
-    if not inst then return false end
-    for _,v in pairs(_G.Ignore) do
-        if v and inst:IsDescendantOf(v) then return true end
+    -- 2) Preserve CoreGui-related (can't modify CoreGui safely)
+    -- (we don't try to modify CoreGui at all)
+
+    -- 3) Preserve player's character and descendants
+    if player.Character and inst:IsDescendantOf(player.Character) then
+        return true
     end
-    return false
-end
 
-local function hasHumanoidAncestor(inst)
-    local a = inst
-    while a and a.Parent do
-        if a:FindFirstChildOfClass and a:FindFirstChildOfClass("Humanoid") then return true end
-        a = a.Parent
+    -- 4) Preserve objects in ReplicatedStorage (assets), avoid touching
+    if inst:IsDescendantOf(ReplicatedStorage) then
+        return true
     end
-    return false
-end
 
-local function isPlayerDescendant(inst)
-    if not inst then return false end
-    for _,p in pairs(Players:GetPlayers()) do
-        if p.Character and inst:IsDescendantOf(p.Character) then return true end
+    -- 5) Preserve obvious NPCs / enemies: Models that have Humanoid or HumanoidRootPart
+    local model = inst
+    while model and not model:IsA("Model") do
+        model = model.Parent
     end
-    return false
-end
-
-local safeSkipClasses = {
-    Script = true, LocalScript = true, ModuleScript = true,
-    RemoteEvent = true, RemoteFunction = true,
-    BindableEvent = true, BindableFunction = true,
-    Animation = true, Animator = true
-}
-local function isSystemClass(inst)
-    if not inst then return false end
-    return safeSkipClasses[inst.ClassName] == true
-end
-
--- compute approx "volume" of a Model (sum of part sizes)
-local function modelVolume(model)
-    if not model or not model:GetChildren then return 0 end
-    local vol = 0
-    for _,part in pairs(model:GetDescendants()) do
-        if part:IsA("BasePart") then
-            local s = part.Size
-            vol = vol + (s.X * s.Y * s.Z)
+    if model and model:IsA("Model") then
+        if model:FindFirstChildOfClass("Humanoid") or model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("PrimaryPart") then
+            return true
         end
     end
-    return vol
-end
 
--- decide if a model is "island-like"
-local function isLikelyIsland(model)
-    if not model or not model:IsA("Model") then return false end
-    if isInIgnore(model) then return false end
-    if CFG.SAFE_PROTECT_HUMANOID and model:FindFirstChildOfClass("Humanoid") then return false end
-    if model:FindFirstChildWhichIsA("Script") or model:FindFirstChildWhichIsA("ModuleScript") or model:FindFirstChildWhichIsA("RemoteEvent") then
-        -- nếu có script/remote, khả năng là game system → skip
-        return false
-    end
-    local vol = modelVolume(model)
-    if vol >= CFG.ISLAND_MIN_VOLUME then
+    -- 6) Preserve instances tagged via CollectionService "Keep" if present (devs sometimes tag important things)
+    if CollectionService and CollectionService:HasTag(inst, "Keep") then
         return true
     end
-    -- also consider name heuristics
-    local name = (model.Name or ""):lower()
-    if name:match("island") or name:match("map") or name:match("terrain") or name:match("stage") then
-        return true
+
+    -- 7) Preserve GUIs attached to world that look like essential: BillboardGui or SurfaceGui with Name containing "Quest" or "UI"
+    if inst:IsA("BillboardGui") or inst:IsA("SurfaceGui") then
+        local name = tostring(inst.Name):lower()
+        if name:find("quest") or name:find("ui") or name:find("hud") or name:find("health") then
+            return true
+        end
     end
+
     return false
 end
 
--- safe simplification for Parts/MeshParts/Decals/Particles
-local function simplifyInstance(inst)
+-- Store backup for restorable props (best-effort)
+local function storeBackup(inst, key, value)
+    if not inst then return end
+    local id = tostring(inst:GetDebugId and inst:GetDebugId() or inst:GetFullName())
+    backup[id] = backup[id] or {instRef = inst}
+    backup[id][key] = value
+end
+
+-- Aggressive apply to a single instance (destructive where needed)
+local function applyAggressive(inst)
     if not inst or not inst.Parent then return end
-    if isInIgnore(inst) then return end
-    if isSystemClass(inst) then return end
-    if inst:IsDescendantOf(game:GetService("CoreGui")) then return end
-    if isPlayerDescendant(inst) then return end
-    if CFG.SAFE_PROTECT_HUMANOID and hasHumanoidAncestor(inst) then return end
+    if isWhitelisted(inst) then return end
 
-    local ok,err
-    -- Part / MeshPart
-    if inst:IsA("MeshPart") or inst:IsA("BasePart") then
-        pcall(function()
-            if CFG.SET_RENDERFIDELITY and inst:IsA("MeshPart") then
-                inst.RenderFidelity = Enum.RenderFidelity.Performance
-            end
-            if CFG.SET_MATERIAL_PLASTIC then
-                inst.Material = Enum.Material.Plastic
-                inst.Reflectance = 0
-                inst.CastShadow = false
-            end
-            -- small transparency so player can still see shapes (xi măng effect)
-            if inst:IsA("BasePart") and not inst:IsDescendantOf(LocalPlayer.PlayerGui or {}) then
-                if inst.Transparency < 0.15 then inst.Transparency = 0.12 end
-            end
-        end)
-    end
-
-    -- Decal/Texture/SurfaceAppearance
+    -- Decals / Textures / SurfaceAppearance -> destroy (irreversible)
     if inst:IsA("Decal") or inst:IsA("Texture") then
-        pcall(function()
-            inst.Transparency = math.max(0.2, inst.Transparency or 0)
-            if CFG.SIMPLIFY_ONLY then
-                -- keep but desaturate via transparency
-            else
-                inst.Texture = "" -- blank texture -> nhẹ
-            end
+        safe(function()
+            storeBackup(inst, "exists", true)
+            inst:Destroy()
         end)
+        return
     end
-
     if inst:IsA("SurfaceAppearance") then
-        pcall(function()
-            if not CFG.SIMPLIFY_ONLY then
-                inst:Destroy()
-            end
+        safe(function()
+            storeBackup(inst, "exists", true)
+            inst:Destroy()
         end)
+        return
     end
 
-    -- Particles / Trails / Sparkles / Fire / Smoke
-    if (inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Sparkles") or inst:IsA("Fire") or inst:IsA("Smoke")) and CFG.DISABLE_PARTICLES then
-        pcall(function()
-            -- keep if attached to player character (player VFX)
-            if isPlayerDescendant(inst) or hasHumanoidAncestor(inst) then
-                -- preserve
-            else
-                if inst:IsA("ParticleEmitter") then
-                    inst.Rate = 0
-                    inst.Lifetime = NumberRange.new(0.03)
-                    inst.Speed = NumberRange.new(0)
-                    inst.Enabled = false
-                else
-                    inst.Enabled = false
+    -- Particle-type visuals -> disable
+    if inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") then
+        safe(function()
+            storeBackup(inst, "Enabled", inst.Enabled)
+            inst.Enabled = false
+        end)
+        return
+    end
+
+    -- SpecialMesh: try to remove texture ids / reduce complexity
+    if inst:IsA("SpecialMesh") then
+        safe(function()
+            storeBackup(inst, "MeshType", inst.MeshType)
+            storeBackup(inst, "MeshId", inst.MeshId)
+            storeBackup(inst, "TextureId", inst.TextureId)
+            -- remove texture to reduce draw (note: may change visuals)
+            inst.TextureId = ""
+            -- keep mesh type but could optionally set to FileMesh none; leave for safety
+        end)
+        return
+    end
+
+    -- MeshPart / UnionOperation: simplify by setting material & transparency
+    if inst:IsA("MeshPart") or inst:IsA("UnionOperation") or inst:IsA("Part") or inst:IsA("BasePart") then
+        safe(function()
+            -- skip parts in player's character
+            if player.Character and inst:IsDescendantOf(player.Character) then return end
+            -- backup
+            storeBackup(inst, "Material", inst.Material)
+            storeBackup(inst, "Color", inst.Color)
+            storeBackup(inst, "Transparency", inst.Transparency)
+            storeBackup(inst, "Reflectance", inst.Reflectance)
+            -- apply cheap look
+            inst.Material = Enum.Material.Plastic
+            inst.Color = Color3.fromRGB(128,128,128)
+            inst.Reflectance = 0
+            inst.Transparency = 0 -- keep visible for collision/hitbox
+        end)
+        return
+    end
+
+    -- Surface GUI / Billboard GUI that are not whitelisted: reduce adornments
+    if inst:IsA("BillboardGui") or inst:IsA("SurfaceGui") then
+        safe(function()
+            -- We try to hide heavy children (ImageLabel/ImageButton)
+            for _,c in ipairs(inst:GetDescendants()) do
+                if c:IsA("ImageLabel") or c:IsA("ImageButton") or c:IsA("VideoFrame") then
+                    pcall(function() c.Image = "" end)
+                    pcall(function() if c:IsA("GuiObject") then c.Visible = false end end)
                 end
             end
         end)
-    end
-
-    -- Explosion
-    if inst:IsA("Explosion") then
-        pcall(function()
-            inst.BlastPressure = 0
-            inst.BlastRadius = 0
-            inst.Visible = false
-        end)
-    end
-
-    -- PostEffects (do not destroy critical ones, but tone down)
-    if CFG.MINIMIZE_POST and inst:IsA("PostEffect") then
-        pcall(function()
-            local cls = inst.ClassName
-            if cls == "BloomEffect" then inst.Intensity = math.min(inst.Intensity or 0.8, 0.5) end
-            if cls == "SunRaysEffect" then inst.Intensity = math.min(inst.Intensity or 0.2, 0.08) end
-            if cls == "DepthOfFieldEffect" or cls == "BlurEffect" or cls == "ColorCorrectEffect" then
-                -- keep CC but reduce heavy params
-                if cls == "ColorCorrectionEffect" then
-                    inst.Saturation = math.min(inst.Saturation or 0.2, 0.12)
-                elseif cls == "DepthOfFieldEffect" or cls == "BlurEffect" then
-                    -- disable heavy DOF/Blur
-                    inst.Enabled = false
-                end
-            end
-        end)
+        return
     end
 end
 
--- main island destroy/simplify
-local function handleModel(model)
-    if not model or not model.Parent then return end
-    if isInIgnore(model) then return end
-    if isPlayerDescendant(model) then return end
-    if CFG.SAFE_PROTECT_HUMANOID and model:FindFirstChildOfClass("Humanoid") then return end
-    if isLikelyIsland(model) then
-        if CFG.DESTROY_ISLANDS and not CFG.SIMPLIFY_ONLY then
-            pcall(function() model:Destroy() end)
-            if CFG.LOG then warn("Destroyed island-like model: "..tostring(model:GetFullName())) end
-            return
-        else
-            -- simplify contents instead of destroy
-            for _,child in pairs(model:GetDescendants()) do
-                pcall(simplifyInstance, child)
-            end
-            if CFG.LOG then warn("Simplified island model: "..tostring(model:GetFullName())) end
+-- Batch processing (to avoid freeze)
+local function batchProcess(list, fn, batchSize, sleepTime)
+    batchSize = batchSize or BATCH_SIZE
+    sleepTime = sleepTime or SLEEP_TIME
+    local n = #list
+    local i = 1
+    while i <= n do
+        local to = math.min(n, i + batchSize - 1)
+        for j = i, to do
+            local inst = list[j]
+            fn(inst)
         end
+        i = to + 1
+        task.wait(sleepTime)
     end
 end
 
--- apply simplification to every instance (safe)
-local function applyGlobalPass()
-    for _,inst in pairs(Workspace:GetDescendants()) do
-        -- skip system classes and UI
-        if inst:IsDescendantOf(game:GetService("CoreGui")) then
-            -- ignore
-        elseif inst:IsDescendantOf(LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui") or {}) then
-            -- keep UI
-        elseif inst.Parent then
-            -- if it's a top-level model, test island
-            local top = inst
-            while top and top.Parent and not top:IsA("Model") do top = top.Parent end
-            if top and top ~= Workspace and top:IsA("Model") then
-                handleModel(top)
-            else
-                pcall(simplifyInstance, inst)
-            end
+-- Lighting + rendering clamp
+local function clampLightingAndRender()
+    safe(function()
+        storeBackup(Lighting, "GlobalShadows", Lighting.GlobalShadows)
+        storeBackup(Lighting, "Brightness", Lighting.Brightness)
+        storeBackup(Lighting, "EnvironmentDiffuseScale", Lighting.EnvironmentDiffuseScale)
+        storeBackup(Lighting, "EnvironmentSpecularScale", Lighting.EnvironmentSpecularScale)
+        Lighting.GlobalShadows = false
+        Lighting.Brightness = 0.4
+        Lighting.EnvironmentDiffuseScale = 0
+        Lighting.EnvironmentSpecularScale = 0
+        Lighting.FogStart = 1e9
+        Lighting.FogEnd = 1e9
+    end)
+    safe(function()
+        if settings and settings().Rendering then
+            storeBackup(settings().Rendering, "QualityLevel", settings().Rendering.QualityLevel)
+            -- set to lowest allowed (may be blocked)
+            settings().Rendering.QualityLevel = 1
         end
-    end
+    end)
 end
 
--- Hook new objects
-Workspace.DescendantAdded:Connect(function(inst)
-    task.wait(0.03)
-    -- immediate protection: if new model likely island, handle it
-    if inst:IsA("Model") then
-        pcall(handleModel, inst)
-    else
-        pcall(simplifyInstance, inst)
+-- apply to current workspace
+log("Starting Fix100 pass...")
+local all = Workspace:GetDescendants()
+batchProcess(all, applyAggressive)
+clampLightingAndRender()
+
+-- Keep effect on new objects (DescendantAdded)
+if _G.__fix100_conn then
+    pcall(function() _G.__fix100_conn:Disconnect() end)
+end
+_G.__fix100_conn = Workspace.DescendantAdded:Connect(function(inst)
+    -- tiny delay to let object initialize
+    task.wait(0.02)
+    if inst and inst.Parent then
+        pcall(function() applyAggressive(inst) end)
     end
 end)
 
--- small lighting/terrain tweaks (non-destructive)
-pcall(function()
-    if CFG.MINIMIZE_POST then
-        for _,v in pairs(Lighting:GetChildren()) do
-            if v:IsA("PostEffect") then
+-- Restore helper (best-effort). Note: destroyed Decal/Texture cannot be recovered by this restore.
+_G.__fix100_restore = function()
+    pcall(function()
+        if _G.__fix100_conn then
+            _G.__fix100_conn:Disconnect()
+            _G.__fix100_conn = nil
+        end
+        for id,info in pairs(backup) do
+            local inst = info.instRef
+            if inst and inst.Parent then
                 pcall(function()
-                    if v.ClassName == "DepthOfFieldEffect" or v.ClassName == "BlurEffect" then v.Enabled = false end
-                    if v.ClassName == "SunRaysEffect" then v.Intensity = math.min(v.Intensity or 0.2, 0.08) end
-                    if v.ClassName == "BloomEffect" then v.Intensity = math.min(v.Intensity or 0.8, 0.5) end
+                    if info.Enabled ~= nil and inst:IsA("ParticleEmitter") then inst.Enabled = info.Enabled end
+                    if info.Material and inst:IsA("BasePart") then inst.Material = info.Material end
+                    if info.Color and inst:IsA("BasePart") then inst.Color = info.Color end
+                    if info.Transparency and inst:IsA("BasePart") then inst.Transparency = info.Transparency end
+                    if info.Reflectance and inst:IsA("BasePart") then inst.Reflectance = info.Reflectance end
+                    if info.MeshId and inst:IsA("SpecialMesh") then inst.MeshId = info.MeshId end
+                    if info.TextureId and inst:IsA("SpecialMesh") then inst.TextureId = info.TextureId end
+                    -- many destroyed decals/textures cannot be restored
                 end)
             end
         end
-    end
-
-    local terrain = Workspace:FindFirstChildOfClass("Terrain")
-    if terrain then
+        -- restore lighting
         pcall(function()
-            terrain.WaterWaveSize = 0
-            terrain.WaterWaveSpeed = 0
-            terrain.WaterReflectance = 0
-            terrain.WaterTransparency = 0
-            if sethiddenproperty then pcall(sethiddenproperty, terrain, "Decoration", false) end
+            if backup[tostring(Lighting)] and backup[tostring(Lighting)].Brightness then
+                Lighting.Brightness = backup[tostring(Lighting)].Brightness
+            end
+            if backup[tostring(Lighting)] and backup[tostring(Lighting)].GlobalShadows ~= nil then
+                Lighting.GlobalShadows = backup[tostring(Lighting)].GlobalShadows
+            end
+            if settings and settings().Rendering and backup[ tostring(settings().Rendering) ] and backup[ tostring(settings().Rendering) ].QualityLevel then
+                settings().Rendering.QualityLevel = backup[ tostring(settings().Rendering) ].QualityLevel
+            end
         end)
-    end
+    end)
+    log("Restore attempted (best-effort). Note: destroyed decals/textures cannot be recovered.")
+end
 
-    if CFG.SET_MATERIAL_PLASTIC then
-        pcall(function()
-            for _,m in pairs(MaterialService:GetChildren()) do pcall(function() m:Destroy() end) end
-            MaterialService.Use2022Materials = false
-        end)
-    end
-end)
-
--- set general rendering to performance-ish
-pcall(function()
-    settings().Rendering.QualityLevel = Enum.QualityLevel.Level02
-    Lighting.GlobalShadows = false
-    Lighting.FogEnd = 9e9
-end)
-
--- run full pass
-applyGlobalPass()
-
--- notify
-notify("Farm-Fix: tối ưu xong. UI & NPC giữ nguyên. Nếu cần bảo toàn island/map: thêm vào _G.Ignore rồi re-run.", 6)
-if CFG.LOG then print("Farm-Fix config:", CFG) end
-
--- convenience: expose quick restore hint (not an auto-restore)
-print("[Farm-Fix] Loaded. To protect an object from being removed, run: table.insert(_G.Ignore, workspace.TheModel) and re-run.")
-
--- EOF
+log("Fix100 applied. To attempt restore, call: _G.__fix100_restore()")
