@@ -1,0 +1,283 @@
+-- FIXLAG XI MĂNG (Client-side, nhẹ cho executor yếu)
+-- Paste vào LocalScript / executor (Local environment)
+-- Author: for you 😏 — batch processing, fallback pcall, 3 mức
+
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local StarterGui = game:GetService("StarterGui")
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+-- Cấu hình mặc định cho 3 mức
+local LEVELS = {
+    ["light"] = {
+        name = "Nhẹ",
+        decals = true,
+        particles = true,
+        material = false,
+        lighting = false,
+        quality = nil, -- nil nghĩa giữ nguyên
+    },
+    ["cement"] = {
+        name = "Xi măng",
+        decals = true,
+        particles = true,
+        material = true,
+        lighting = true,
+        quality = 1, -- QualityLevel low
+    },
+    ["hell"] = {
+        name = "Địa ngục",
+        decals = true,
+        particles = true,
+        material = true,
+        lighting = true,
+        quality = 0,
+    }
+}
+
+local currentLevel = "cement"
+local enabled = false
+local processing = false
+
+-- Safe wrappers
+local safeCall = function(fn, ...)
+    local ok, res = pcall(fn, ...)
+    return ok, res
+end
+
+-- Apply changes to a single instance (fast & minimal)
+local function applyToInstance(inst, cfg)
+    if not inst or not inst.Parent then return end
+    local class = inst.ClassName
+
+    -- Parts / MeshPart / BasePart
+    if inst:IsA("BasePart") then
+        if cfg.material then
+            -- try to set simple material & reflectance
+            safeCall(function()
+                inst.Material = Enum.Material.Plastic
+                inst.Reflectance = 0
+            end)
+        end
+    end
+
+    -- Decal / Texture: destroy or remove
+    if cfg.decals then
+        if inst:IsA("Decal") or inst:IsA("Texture") then
+            safeCall(function() inst:Destroy() end)
+            return
+        end
+    end
+
+    -- Particle systems
+    if (inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam")) then
+        if cfg.particles then
+            safeCall(function() inst.Enabled = false end)
+        end
+    end
+
+    -- Special-case: SurfaceAppearance (can be heavy)
+    if inst:IsA("SurfaceAppearance") and cfg.decals then
+        safeCall(function() inst.Parent = nil end)
+    end
+
+    -- Decent fallback: reduce texture/mesh complexity
+    if inst:IsA("SpecialMesh") and cfg.material then
+        safeCall(function()
+            inst.Offset = Vector3.new(0,0,0)
+            -- do not touch MeshId to avoid breaking animations; keep minimal
+        end)
+    end
+end
+
+-- Batch processing to avoid freezing weak clients
+local function batchProcess(list, cfg, batchSize, pauseTime)
+    batchSize = batchSize or 60
+    pauseTime = pauseTime or 0.02
+    local n = #list
+    local i = 1
+    while i <= n do
+        local to = math.min(n, i + batchSize - 1)
+        for j = i, to do
+            local inst = list[j]
+            -- guard: skip live player characters to avoid messing camera/tools
+            if inst and inst:IsDescendantOf(workspace) then
+                -- skip player characters (safety)
+                if player.Character and inst:IsDescendantOf(player.Character) then
+                    -- skip
+                else
+                    applyToInstance(inst, cfg)
+                end
+            end
+        end
+        i = to + 1
+        task.wait(pauseTime)
+    end
+end
+
+-- Apply lighting/quality changes (safe)
+local function applyLighting(cfg)
+    -- Lighting tweaks guarded by pcall
+    safeCall(function()
+        Lighting.GlobalShadows = not cfg.lighting and Lighting.GlobalShadows or false
+        if cfg.lighting then
+            Lighting.Brightness = 1
+            Lighting.EnvironmentDiffuseScale = 0
+            Lighting.EnvironmentSpecularScale = 0
+            -- Fog far away so it doesn't render
+            Lighting.FogStart = 1e9
+            Lighting.FogEnd = 1e9
+        end
+    end)
+    -- Try to set Rendering quality if allowed
+    if cfg.quality ~= nil then
+        pcall(function()
+            if settings and settings().Rendering then
+                -- some executors block this — pcall covers it
+                settings().Rendering.QualityLevel = cfg.quality
+            end
+        end)
+    end
+end
+
+-- Main apply function
+local function applyFix(cfgKey)
+    if processing then return end
+    processing = true
+    local cfg = LEVELS[cfgKey] or LEVELS["cement"]
+
+    -- snapshot workspace descendants and process in batches
+    local descendants = workspace:GetDescendants()
+    batchProcess(descendants, cfg, 80, 0.015)
+
+    -- lighting
+    applyLighting(cfg)
+
+    -- hook to newly added instances to keep "cement" effect
+    -- only attach if cfg has heavy changes to avoid overhead
+    if cfg.decals or cfg.particles or cfg.material then
+        -- first disconnect existing if any
+        if _G.__fixlag_conn then
+            _G.__fixlag_conn:Disconnect()
+            _G.__fixlag_conn = nil
+        end
+        _G.__fixlag_conn = workspace.DescendantAdded:Connect(function(inst)
+            -- tiny defer to avoid race while object initializes
+            task.wait(0.05)
+            -- skip player character items
+            if player.Character and inst:IsDescendantOf(player.Character) then return end
+            applyToInstance(inst, cfg)
+        end)
+    end
+
+    processing = false
+end
+
+-- Toggle function
+local function toggle()
+    enabled = not enabled
+    if enabled then
+        applyFix(currentLevel)
+        StarterGui:SetCore("SendNotification", {Title="Fixlag", Text="Xi măng ON ("..LEVELS[currentLevel].name..")", Duration=2})
+    else
+        -- turn off: restore only minimal things (can't fully restore destroyed decals)
+        -- we will only re-enable particles and reset quality/shadows to defaults
+        safeCall(function()
+            if _G.__fixlag_conn then
+                _G.__fixlag_conn:Disconnect()
+                _G.__fixlag_conn = nil
+            end
+            -- re-enable particle-like by scanning (light pass, small batch)
+            local desc = workspace:GetDescendants()
+            for i=1,#desc do
+                local inst = desc[i]
+                if inst and (inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam")) then
+                    pcall(function() inst.Enabled = true end)
+                end
+            end
+            -- try reset rendering (best-effort)
+            pcall(function()
+                if settings and settings().Rendering then
+                    settings().Rendering.QualityLevel = 21 -- default-ish high
+                end
+            end)
+            Lighting.GlobalShadows = true
+            StarterGui:SetCore("SendNotification", {Title="Fixlag", Text="Xi măng OFF", Duration=2})
+        end)
+    end
+end
+
+-- Simple UI: small toggle + level buttons (minimal, avoids heavy assets)
+local function createUI()
+    local screen = Instance.new("ScreenGui")
+    screen.Name = "FixLagXiMang_UI"
+    screen.ResetOnSpawn = false
+    screen.Parent = player:WaitForChild("PlayerGui")
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.fromOffset(180, 120)
+    frame.Position = UDim2.new(0, 12, 0.5, -60)
+    frame.BackgroundTransparency = 0.35
+    frame.BackgroundColor3 = Color3.fromRGB(30,30,30)
+    frame.BorderSizePixel = 0
+    frame.Parent = screen
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1,0,0,24)
+    title.BackgroundTransparency = 1
+    title.Text = "FixLag XiMăng"
+    title.TextColor3 = Color3.fromRGB(255,255,255)
+    title.Font = Enum.Font.SourceSansBold
+    title.TextSize = 14
+    title.Parent = frame
+
+    local btnToggle = Instance.new("TextButton")
+    btnToggle.Size = UDim2.fromOffset(160, 30)
+    btnToggle.Position = UDim2.new(0,10,0,36)
+    btnToggle.Text = "BẬT/TẮT"
+    btnToggle.Parent = frame
+    btnToggle.MouseButton1Click:Connect(function()
+        toggle()
+        btnToggle.Text = enabled and "TẮT (ON)" or "BẬT (OFF)"
+    end)
+
+    local function makeLevelButton(name, key, y)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.fromOffset(80, 24)
+        b.Position = UDim2.new(0, 10 + (y * 90), 0, 74)
+        b.Text = name
+        b.Parent = frame
+        b.MouseButton1Click:Connect(function()
+            currentLevel = key
+            if enabled then
+                applyFix(currentLevel)
+            end
+            StarterGui:SetCore("SendNotification", {Title="Fixlag", Text="Mức: "..name, Duration=1.5})
+        end)
+        return b
+    end
+
+    -- Buttons: Nhẹ | Xi măng | Địa ngục
+    local b1 = makeLevelButton("Nhẹ", "light", 0)
+    local b2 = makeLevelButton("Xi măng", "cement", 1)
+    local b3 = makeLevelButton("Địa ngục", "hell", 2)
+
+    -- Keyboard toggle (RightShift)
+    local UserInputService = game:GetService("UserInputService")
+    UserInputService.InputBegan:Connect(function(inp, gpe)
+        if gpe then return end
+        if inp.KeyCode == Enum.KeyCode.RightShift then
+            toggle()
+            btnToggle.Text = enabled and "TẮT (ON)" or "BẬT (OFF)"
+        end
+    end)
+end
+
+-- Run UI creation safely (many executors have PlayerGui)
+pcall(function() createUI() end)
+
+-- Auto-apply once for convenience (comment if you don't want)
+enabled = true
+applyFix(currentLevel)
+StarterGui:SetCore("SendNotification", {Title="Fixlag", Text="Xi măng ON (auto)", Duration=2})
