@@ -1,207 +1,145 @@
---[[ 
-  DucLuongg FixLag™ — 50% Edition
-  Mục tiêu: giảm ~50% tải đồ họa/particle/overdraw, giữ đảo/quái/UI/hitbox
-  Client-side only. Dán là chạy.
-]]
-
--- ========== CONFIG ==========
-local CONFIG = {
-    MODE_NAME = "Ultra50",
-    LOCK_FPS = 120,                -- setfpscap nếu exploit hỗ trợ (nil để bỏ)
-    DESTROY_HEAVY_EFFECTS = false, -- true = destroy some heavy effects (unsafe for some games)
-    WATER_REDUCE = true,           -- giảm hiệu ứng nước
-    MIN_RENDER_LEVEL = Enum.QualityLevel.Level01, -- aggressive
-    NOTIFY = true,
-    SKILL_REDUCTION = true,        -- reduce particles/trails/explosions (non-destructive for characters)
-    PROTECT_PLAYERS = true,        -- không đụng player chars
-    PROTECT_NPCS_WITH_HUMANOID = true, -- không đụng NPC có Humanoid
-    IGNORE_LIST = _G.Ignore or {}  -- thêm object vào _G.Ignore để bảo vệ
-}
--- ============================
+-- FixLag 50% (auto-run, client-side, non-destructive)
+-- Mục tiêu: giảm ~50% load của particle/decals/lighting trên client
+-- Paste vào LocalScript / executor rồi chơi thôi.
 
 local Players = game:GetService("Players")
 local Lighting = game:GetService("Lighting")
-local RunService = game:GetService("RunService")
-local Workspace = game:GetService("Workspace")
-local MaterialService = game:GetService("MaterialService")
-local StarterGui = game:GetService("StarterGui")
-local LocalPlayer = Players.LocalPlayer
+local player = Players.LocalPlayer
 
-local function notify(text, sec)
-    if not CONFIG.NOTIFY then return end
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {Title = "DucLuongg FixLag™", Text = text, Duration = sec or 6})
-    end)
+local TARGET_RATIO = 0.5 -- giữ 50% của hiệu ứng gốc
+local BATCH_SIZE = 80
+local PAUSE = 0.02
+
+_G.__fixlag_backup = _G.__fixlag_backup or {}
+local backup = _G.__fixlag_backup
+
+local function safe(fn, ...)
+    local ok, a, b = pcall(fn, ...)
+    return ok, a, b
 end
 
-local function isInIgnore(inst)
-    if not inst then return false end
-    for _,v in pairs(CONFIG.IGNORE_LIST) do
-        if v and inst:IsDescendantOf(v) then return true end
-    end
-    return false
+local function store(inst, key, value)
+    if not inst then return end
+    local id = tostring(inst:GetDebugId and inst:GetDebugId() or inst:GetFullName())
+    backup[id] = backup[id] or {instRef = inst}
+    backup[id][key] = value
 end
 
-local function ancestorHasHumanoid(inst)
-    local a = inst
-    while a and a.Parent do
-        if a:FindFirstChildOfClass and a:FindFirstChildOfClass("Humanoid") then return true end
-        a = a.Parent
-    end
-    return false
-end
-
-local function isProtected(inst)
-    if not inst then return false end
-    if isInIgnore(inst) then return true end
-    if CONFIG.PROTECT_PLAYERS and inst:IsDescendantOf(Players) then return true end
-    if CONFIG.PROTECT_NPCS_WITH_HUMANOID and ancestorHasHumanoid(inst) then return true end
-    -- small safeguard: don't touch CoreGui / PlayerGui
-    if inst:IsDescendantOf(game:GetService("CoreGui")) then return true end
-    if LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui") and inst:IsDescendantOf(LocalPlayer.PlayerGui) then return true end
-    return false
-end
-
--- Aggressive but safe tweaks applied to a single instance
-local function optimizeInstance(inst)
+local function applyTo(inst)
     if not inst or not inst.Parent then return end
-    if isProtected(inst) then return end
+    -- skip player's own character to avoid breaking controls/tools
+    if player and player.Character and inst:IsDescendantOf(player.Character) then return end
 
-    -- Part / MeshPart tweaks
-    if inst:IsA("MeshPart") then
-        pcall(function()
-            inst.RenderFidelity = Enum.RenderFidelity.Performance
-            inst.Material = Enum.Material.SmoothPlastic
-            inst.CastShadow = false
-            inst.Reflectance = 0
+    -- ParticleEmitter: reduce Rate
+    if inst:IsA("ParticleEmitter") then
+        safe(function()
+            if inst:GetAttribute("__fix50_origRate") == nil then
+                inst:SetAttribute("__fix50_origRate", inst.Rate)
+                store(inst, "Rate", inst.Rate)
+            end
+            inst.Rate = (inst:GetAttribute("__fix50_origRate") or inst.Rate) * TARGET_RATIO
         end)
-    elseif inst:IsA("BasePart") then
-        pcall(function()
-            inst.Material = Enum.Material.SmoothPlastic
-            inst.Reflectance = 0
-            inst.CastShadow = false
-        end)
+        return
     end
 
-    -- Particle / Trail / Fire / Smoke / Sparkles
-    if CONFIG.SKILL_REDUCTION then
-        if inst:IsA("ParticleEmitter") then
-            pcall(function()
-                inst.Rate = 0
-                inst.Lifetime = NumberRange.new(0.05)
-                inst.Speed = NumberRange.new(0)
-                inst.Enabled = false
-            end)
-        elseif inst:IsA("Trail") then
-            pcall(function() inst.Enabled = false end)
-        elseif inst:IsA("Fire") or inst:IsA("Smoke") then
-            pcall(function() inst.Enabled = false end)
-        elseif inst:IsA("Explosion") then
-            pcall(function() inst.BlastPressure = 0; inst.BlastRadius = math.min(inst.BlastRadius or 8, 6); inst.Visible = false end)
-        end
+    -- Trail / Beam: try to reduce lifetime / disable if super heavy (best-effort)
+    if inst:IsA("Trail") or inst:IsA("Beam") then
+        safe(function()
+            store(inst, "Enabled", inst.Enabled)
+            -- gentle approach: keep them but try to shorten lifetimes if possible
+            -- many Trails/Beams don't expose lifetime; fallback: if thick, disable
+            if inst.Enabled then
+                -- heuristic: if parts length large, disable; can't reliably measure, so keep enabled
+                -- leave Enabled as-is but kept in backup
+            end
+        end)
+        return
     end
 
-    -- Decal / Texture: reduce draw cost by lowering transparency a little (non-destructive)
+    -- Decal / Texture: increase transparency proportionally
     if inst:IsA("Decal") or inst:IsA("Texture") then
-        pcall(function()
-            if inst.Transparency and inst.Transparency < 0.2 then
-                inst.Transparency = 0.15 -- tiny change to save fillrate, won't hide most decals
-            end
+        safe(function()
+            local orig = inst.Transparency or 0
+            store(inst, "Transparency", orig)
+            local increase = (1 - TARGET_RATIO) -- 0.5
+            local newT = orig + (1 - orig) * increase
+            inst.Transparency = math.clamp(newT, 0, 1)
         end)
+        return
     end
+end
 
-    -- PostEffect: if heavy, disable or tone down
-    if inst:IsA("PostEffect") then
-        local t = inst.ClassName
-        if t == "BloomEffect" or t == "SunRaysEffect" then
-            if CONFIG.DESTROY_HEAVY_EFFECTS then
-                pcall(function() inst:Destroy() end)
-            else
-                pcall(function()
-                    if inst.Name:match("Bloom") then inst.Intensity = math.min(inst.Intensity or 0.6, 0.6) end
-                    if inst.Name:match("Sun") then inst.Intensity = math.min(inst.Intensity or 0.2, 0.12) end
-                    inst.Enabled = true
-                end)
-            end
-        else
-            -- safe-disable depth of field / blur if present
-            if t == "DepthOfFieldEffect" or t == "BlurEffect" then
-                pcall(function() inst.Enabled = false end)
-            end
+local function batchProcess(list)
+    local n = #list
+    local i = 1
+    while i <= n do
+        local to = math.min(n, i + BATCH_SIZE - 1)
+        for j = i, to do
+            local inst = list[j]
+            applyTo(inst)
         end
+        i = to + 1
+        task.wait(PAUSE)
     end
 end
 
--- Apply to current world (non-destructive)
-for _,inst in pairs(Workspace:GetDescendants()) do
-    pcall(optimizeInstance, inst)
-end
-
--- Connect future instances
-Workspace.DescendantAdded:Connect(function(inst)
-    task.wait(0.05)
-    pcall(optimizeInstance, inst)
-end)
-
--- GLOBAL rendering settings (aggressive)
-pcall(function()
-    settings().Rendering.QualityLevel = CONFIG.MIN_RENDER_LEVEL
-end)
-
--- Terrain / Water tweaks
-if CONFIG.WATER_REDUCE then
+local function applyLighting()
+    safe(function()
+        store(Lighting, "GlobalShadows", Lighting.GlobalShadows)
+        store(Lighting, "Brightness", Lighting.Brightness)
+        Lighting.GlobalShadows = false -- tiết kiệm ánh sáng
+        Lighting.Brightness = math.max(0.3, Lighting.Brightness * 0.9) -- nhẹ nhàng giảm brightness
+    end)
+    -- try to set rendering quality (may be blocked by executor)
     pcall(function()
-        local terrain = Workspace:FindFirstChildOfClass("Terrain")
-        if terrain then
-            terrain.WaterWaveSize = 0
-            terrain.WaterWaveSpeed = 0
-            terrain.WaterReflectance = 0
-            terrain.WaterTransparency = 0
-            if sethiddenproperty then pcall(function() sethiddenproperty(terrain, "Decoration", false) end) end
+        if settings and settings().Rendering then
+            store(settings().Rendering, "QualityLevel", settings().Rendering.QualityLevel)
+            settings().Rendering.QualityLevel = 14 -- trung bình thấp
         end
     end)
 end
 
--- MaterialService fallback
-pcall(function()
-    for _,v in pairs(MaterialService:GetChildren()) do
-        pcall(function() v:Destroy() end)
-    end
-    pcall(function() MaterialService.Use2022Materials = false end)
+-- main
+local desc = workspace:GetDescendants()
+batchProcess(desc)
+applyLighting()
+
+-- keep effect on new spawned client-side items
+if _G.__fixlag_conn50 then
+    pcall(function() _G.__fixlag_conn50:Disconnect() end)
+end
+_G.__fixlag_conn50 = workspace.DescendantAdded:Connect(function(inst)
+    task.wait(0.03)
+    applyTo(inst)
 end)
 
--- reduce lighting blacks / keep brightness but no heavy global post effects
-pcall(function()
-    Lighting.GlobalShadows = false          -- big perf win
-    Lighting.FogEnd = 1e9
-    Lighting.ShadowSoftness = 0
-    -- keep ambient/brightness to stay "sáng"
-    Lighting.Brightness = math.max(Lighting.Brightness, 1.8)
-    Lighting.OutdoorAmbient = Lighting.OutdoorAmbient or Color3.fromRGB(120,120,120)
-end)
-
--- Camera shake/camera heavy update reduction (soft)
-do
-    local cam = Workspace.CurrentCamera
-    if cam then
-        -- gentle damp to camera updates (reduces violent shakes)
-        RunService.RenderStepped:Connect(function()
-            -- cheap clamp: we don't overwrite camera each frame, just nudge it minimally if needed
-            -- (deliberately minimal to avoid interfering with gameplay)
-            if cam and cam.CameraType == Enum.CameraType.Custom then
-                -- no-op heavy operations here; keep light
-            end
-        end)
+-- provide a restore helper (optional) - không auto gọi
+_G.__fixlag50_restore = function()
+    if _G.__fixlag_conn50 then
+        pcall(function() _G.__fixlag_conn50:Disconnect() end)
+        _G.__fixlag_conn50 = nil
     end
+    for id, info in pairs(backup) do
+        local inst = info.instRef
+        if inst and inst.Parent then
+            pcall(function()
+                if info.Rate and inst:IsA("ParticleEmitter") then inst.Rate = info.Rate end
+                if info.Transparency and (inst:IsA("Decal") or inst:IsA("Texture")) then inst.Transparency = info.Transparency end
+                if info.Enabled ~= nil and (inst:IsA("Trail") or inst:IsA("Beam") or inst:IsA("ParticleEmitter")) then inst.Enabled = info.Enabled end
+            end)
+        end
+    end
+    -- restore lighting
+    pcall(function()
+        if backup[tostring(Lighting)] and backup[tostring(Lighting)].Brightness then
+            Lighting.Brightness = backup[tostring(Lighting)].Brightness
+        elseif backup["Lighting"] and backup["Lighting"].Brightness then
+            Lighting.Brightness = backup["Lighting"].Brightness
+        end
+        if backup[tostring(Lighting)] and backup[tostring(Lighting)].GlobalShadows ~= nil then
+            Lighting.GlobalShadows = backup[tostring(Lighting)].GlobalShadows
+        end
+    end)
 end
 
--- setfpscap if available
-if CONFIG.LOCK_FPS and type(CONFIG.LOCK_FPS) == "number" and setfpscap then
-    pcall(function() setfpscap(CONFIG.LOCK_FPS) end)
-end
-
--- Final notification
-notify("DucLuongg FixLag™ 50% — applied. Nếu game bị mất thứ gì: thêm object đó vào _G.Ignore và reload.", 8)
-
--- print small summary for console
-print("DucLuongg FixLag 50% loaded. MODE:", CONFIG.MODE_NAME)
+print("FixLag 50% applied (auto). To restore (if needed) call: _G.__fixlag50_restore()")
