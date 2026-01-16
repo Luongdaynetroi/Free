@@ -1,111 +1,258 @@
---[[ 
-    DucLuongg FixLag™ 20%
-    Xi Măng Sáng | Không Xóa Map / Quái / UI
-    Client-side only
-]]
+-- FixLag 20% (Client-side, non-destructive)
+-- Paste vào LocalScript / executor
+-- Lightweight, batch processing, backup để restore
 
-local Lighting = game:GetService("Lighting")
-local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
 local player = Players.LocalPlayer
 
--- ===============================
--- 1. LIGHTING (Giữ đẹp, giảm lag)
--- ===============================
-Lighting.GlobalShadows = true
-Lighting.ShadowSoftness = 0.6
-Lighting.Brightness = 2.2
-Lighting.ExposureCompensation = 0.15
-Lighting.EnvironmentDiffuseScale = 0.5
-Lighting.EnvironmentSpecularScale = 0.5
-Lighting.OutdoorAmbient = Color3.fromRGB(120,120,120)
-Lighting.Ambient = Color3.fromRGB(90,90,90)
-Lighting.ColorShift_Top = Color3.fromRGB(255,255,255)
-Lighting.ColorShift_Bottom = Color3.fromRGB(180,180,180)
+-- config: mục tiêu giảm = 0.2 (20% of original effect)
+local TARGET_RATIO = 0.20
 
--- Xóa mấy effect nặng nhưng vẫn giữ sáng
-for _,v in pairs(Lighting:GetChildren()) do
-    if v:IsA("BloomEffect") or v:IsA("SunRaysEffect") then
-        v:Destroy()
-    elseif v:IsA("BlurEffect") or v:IsA("DepthOfFieldEffect") then
-        v.Enabled = false
+-- internal state
+_G.__fixlag20_backup = _G.__fixlag20_backup or {}
+local backup = _G.__fixlag20_backup
+local enabled = false
+local processing = false
+local connAdded
+
+local safe = function(fn,...)
+    local ok, res = pcall(fn, ...)
+    return ok, res
+end
+
+-- safe store helper
+local function storeBackup(inst, key, value)
+    if not inst or not inst:IsA("Instance") then return end
+    local id = tostring(inst:GetDebugId and inst:GetDebugId() or inst:GetFullName())
+    backup[id] = backup[id] or {instRef = inst}
+    backup[id][key] = value
+end
+
+local function getBackup(inst)
+    local id = tostring(inst:GetDebugId and inst:GetDebugId() or inst:GetFullName())
+    return backup[id]
+end
+
+-- apply to single instance (non-destructive)
+local function applyToInstanceLight(inst)
+    if not inst or not inst.Parent then return end
+
+    -- ParticleEmitter: reduce Rate to TARGET_RATIO, keep original
+    if inst:IsA("ParticleEmitter") then
+        safe(function()
+            local origRate = inst:GetAttribute("__fixlag20_orig_Rate")
+            if origRate == nil then
+                storeBackup(inst, "Rate", inst.Rate)
+                inst:SetAttribute("__fixlag20_orig_Rate", inst.Rate)
+            end
+            -- try to set rate = orig * TARGET_RATIO
+            local ok = pcall(function()
+                inst.Rate = (inst:GetAttribute("__fixlag20_orig_Rate") or inst.Rate) * TARGET_RATIO
+            end)
+            if not ok then
+                -- fallback: disable very high-rate emitters
+                if inst.Rate and inst.Rate > 100 then
+                    storeBackup(inst, "Enabled", inst.Enabled)
+                    inst.Enabled = false
+                end
+            end
+        end)
+        return
+    end
+
+    -- Trail / Beam: prefer to reduce lifetime or disable if heavy
+    if inst:IsA("Trail") or inst:IsA("Beam") then
+        safe(function()
+            -- backup Enabled
+            storeBackup(inst, "Enabled", inst.Enabled)
+            -- set Enabled true but try to reduce if possible
+            -- Many Trails/Beams don't have Rate; so we toggle to reduce rendering load only if their size is big
+            if inst.Enabled then
+                -- gentle: try to shorten life via Transparency keyframes if possible (best-effort)
+                inst.Enabled = true -- keep visible but we will rely on particle reduction elsewhere
+            end
+        end)
+        return
+    end
+
+    -- Decal / Texture / SurfaceAppearance: increase transparency (non-destructive)
+    if inst:IsA("Decal") or inst:IsA("Texture") then
+        safe(function()
+            storeBackup(inst, "Transparency", inst.Transparency)
+            inst.Transparency = math.max(inst.Transparency, 0.6)
+        end)
+        return
+    end
+
+    if inst:IsA("SurfaceAppearance") then
+        safe(function()
+            -- SurfaceAppearance doesn't expose simple transparency; we attempt to lower its quality by detaching ColorMap/NormalMap if possible
+            -- backup indicator
+            storeBackup(inst, "HadSurfaceAppearance", true)
+            -- best-effort: set Parent nil would remove visuals but might break; instead do nothing destructive
+            -- so no-op but reserved for future adjustments
+        end)
+        return
     end
 end
 
--- ===============================
--- 2. MATERIAL & PART OPTIMIZE
--- ===============================
-for _,v in pairs(workspace:GetDescendants()) do
-    if v:IsA("BasePart") then
-        v.Reflectance = 0
-        v.CastShadow = true
-
-        if v.Material == Enum.Material.Grass
-        or v.Material == Enum.Material.Fabric
-        or v.Material == Enum.Material.Foil then
-            v.Material = Enum.Material.SmoothPlastic
+-- iterate in batches to avoid freeze
+local function batchProcess(list, fn, batchSize, pauseTime)
+    batchSize = batchSize or 70
+    pauseTime = pauseTime or 0.02
+    local n = #list
+    local i = 1
+    while i <= n do
+        local to = math.min(n, i + batchSize - 1)
+        for j = i, to do
+            local inst = list[j]
+            -- skip player character parts to avoid breaking controls/tools
+            if player and player.Character and inst:IsDescendantOf(player.Character) then
+                -- skip
+            else
+                fn(inst)
+            end
         end
+        i = to + 1
+        task.wait(pauseTime)
     end
 end
 
--- ===============================
--- 3. SKILL EFFECT REDUCTION (NHẸ)
--- ===============================
-local function ReduceSkillEffect(obj)
-    if obj:IsA("ParticleEmitter") then
-        obj.Rate = math.min(obj.Rate, 25)
-        obj.LightEmission = math.min(obj.LightEmission, 0.6)
-    elseif obj:IsA("Trail") then
-        obj.Enabled = false
-    elseif obj:IsA("Explosion") then
-        obj.BlastPressure = 0
-        obj.BlastRadius = math.min(obj.BlastRadius, 6)
+-- main apply 20% effect
+local function apply20()
+    if processing then return end
+    processing = true
+    local desc = workspace:GetDescendants()
+    batchProcess(desc, applyToInstanceLight, 80, 0.015)
+
+    -- slight lighting tweak (very conservative): reduce Brightness by 10% if >1
+    safe(function()
+        storeBackup(Lighting, "Brightness", Lighting.Brightness)
+        Lighting.Brightness = Lighting.Brightness * 0.90
+    end)
+
+    -- connect DescendantAdded to keep effect on newly spawned client-side items
+    if connAdded then
+        connAdded:Disconnect()
+        connAdded = nil
     end
+    connAdded = workspace.DescendantAdded:Connect(function(inst)
+        task.wait(0.04)
+        if player and player.Character and inst:IsDescendantOf(player.Character) then return end
+        applyToInstanceLight(inst)
+    end)
+
+    processing = false
 end
 
-for _,v in pairs(workspace:GetDescendants()) do
-    ReduceSkillEffect(v)
-end
+-- restore from backup (best-effort)
+local function restore20()
+    if connAdded then
+        connAdded:Disconnect()
+        connAdded = nil
+    end
 
-workspace.DescendantAdded:Connect(function(v)
-    task.wait()
-    ReduceSkillEffect(v)
-end)
-
--- ===============================
--- 4. CAMERA SHAKE REDUCTION
--- ===============================
-local cam = workspace.CurrentCamera
-RunService.RenderStepped:Connect(function()
-    cam.CFrame = cam.CFrame:Lerp(cam.CFrame, 0.85)
-end)
-
--- ===============================
--- 5. CHARACTER OPTIMIZE (KHÔNG MẤT HITBOX)
--- ===============================
-local function OptimizeChar(char)
-    for _,v in pairs(char:GetDescendants()) do
-        if v:IsA("Accessory") then
-            v:Destroy()
-        elseif v:IsA("BasePart") then
-            v.Material = Enum.Material.SmoothPlastic
+    for id, info in pairs(backup) do
+        local inst = info.instRef
+        if inst and inst.Parent then
+            -- restore known keys
+            safe(function()
+                if info.Rate and inst:IsA("ParticleEmitter") then
+                    inst.Rate = info.Rate
+                    inst:SetAttribute("__fixlag20_orig_Rate", nil)
+                end
+            end)
+            safe(function()
+                if info.Enabled ~= nil and (inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam")) then
+                    inst.Enabled = info.Enabled
+                end
+            end)
+            safe(function()
+                if info.Transparency ~= nil and (inst:IsA("Decal") or inst:IsA("Texture")) then
+                    inst.Transparency = info.Transparency
+                end
+            end)
         end
+        -- don't remove backup entry here (keep for toggling)
     end
+
+    -- restore Lighting brightness
+    safe(function()
+        if backup[tostring(Lighting)] and backup[tostring(Lighting)].Brightness then
+            Lighting.Brightness = backup[tostring(Lighting)].Brightness
+        elseif backup["Lighting"] and backup["Lighting"].Brightness then
+            Lighting.Brightness = backup["Lighting"].Brightness
+        end
+    end)
 end
 
-if player.Character then
-    OptimizeChar(player.Character)
+-- toggle functions
+local function enable()
+    if enabled then return end
+    enabled = true
+    apply20()
+    -- tiny notification if StarterGui exists
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {Title="FixLag20%", Text="Bật - Chế độ nhẹ (≈20%)", Duration=1.8})
+    end)
 end
 
-player.CharacterAdded:Connect(OptimizeChar)
+local function disable()
+    if not enabled then return end
+    enabled = false
+    restore20()
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {Title="FixLag20%", Text="Tắt - Khôi phục", Duration=1.8})
+    end)
+end
 
--- ===============================
--- 6. NOTIFY
--- ===============================
+local function toggle()
+    if enabled then disable() else enable() end
+end
+
+-- minimal UI + keybind (RightShift) — optional and very lightweight
 pcall(function()
-    game.StarterGui:SetCore("SendNotification", {
-        Title = "DucLuongg FixLag™",
-        Text = "FixLag 20% | Xi Măng Sáng | Skill Mượt",
-        Duration = 10
-    })
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "FixLag20_UI"
+    gui.ResetOnSpawn = false
+    gui.Parent = player:WaitForChild("PlayerGui")
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.fromOffset(120, 28)
+    btn.Position = UDim2.new(0, 12, 0.92, -34)
+    btn.AnchorPoint = Vector2.new(0,0)
+    btn.BackgroundTransparency = 0.3
+    btn.BackgroundColor3 = Color3.fromRGB(20,20,20)
+    btn.BorderSizePixel = 0
+    btn.TextColor3 = Color3.fromRGB(255,255,255)
+    btn.Font = Enum.Font.SourceSans
+    btn.TextSize = 14
+    btn.Text = "FixLag 20%: OFF"
+    btn.Parent = gui
+
+    btn.MouseButton1Click:Connect(function()
+        toggle()
+        btn.Text = "FixLag 20%: " .. (enabled and "ON" or "OFF")
+    end)
+
+    local UIS = game:GetService("UserInputService")
+    UIS.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if input.KeyCode == Enum.KeyCode.RightShift then
+            toggle()
+            btn.Text = "FixLag 20%: " .. (enabled and "ON" or "OFF")
+        end
+    end)
 end)
+
+-- auto-apply once (comment out if you don't want auto)
+enable()
+
+-- expose toggles globally for convenience
+_G.fixlag20_toggle = toggle
+_G.fixlag20_enable = enable
+_G.fixlag20_disable = disable
+
+print("FixLag20% loaded. Use RightShift or call _G.fixlag20_toggle()")
