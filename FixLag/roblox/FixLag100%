@@ -1,121 +1,263 @@
--- DucLuongg FixLag™ — 100% Edition (Ultra)
--- CỰC KÍ TIẾT KIỆM: nhiều thứ được clear/turned-off. Bảo đảm thêm vào _G.Ignore cho map/NPC quan trọng trước khi chạy.
+-- ==========================
+-- FIXLAG 100% - AUTO RUN
+-- Max FPS, destructive (destroy decals/textures), minimal UI preserved
+-- Paste vào LocalScript / executor (client-side)
+-- ==========================
 
-if not _G.Ignore then _G.Ignore = {} end
-local CONFIG = {
-    NAME = "FixLag100",
-    LOCK_FPS = 60, -- lower cap để giảm render
-    STRIP_MESHES = true,
-    STRIP_TEXTURES = true,
-    DISABLE_PARTICLES = true,
-    DISABLE_POST = true,
-    FORCE_PLASTIC = true,
-    PROTECT_PLAYERS = true,
-    PROTECT_NPCS_WITH_HUMANOID = true,
-}
+-- CONFIG
+local BATCH_SIZE = 60       -- số instance xử lý mỗi lần (giảm để tránh đơ)
+local SLEEP_TIME = 0.012    -- thời gian chờ giữa các batch
+local DEBUG = true
 
 local Players = game:GetService("Players")
-local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
-local MaterialService = game:GetService("MaterialService")
-local StarterGui = game:GetService("StarterGui")
-local RunService = game:GetService("RunService")
-local LocalPlayer = Players.LocalPlayer
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local player = Players.LocalPlayer
 
-local function notify(t) pcall(function() StarterGui:SetCore("SendNotification",{Title="DucLuongg FixLag100",Text=t,Duration=6}) end) end
+-- backup store (note: destroyed decals/textures can't be restored)
+_G.__fix100_backup = _G.__fix100_backup or {}
+local backup = _G.__fix100_backup
 
-local function isIgnored(inst)
-    if not inst then return false end
-    for _,v in pairs(_G.Ignore) do if v and inst:IsDescendantOf(v) then return true end end
-    return false
+local function log(...)
+    if not DEBUG then return end
+    pcall(function() print("[Fix100] ", ...) end)
 end
 
-local function ancestorHasHumanoid(inst)
-    local a = inst
-    while a and a.Parent do
-        if a:FindFirstChildOfClass and a:FindFirstChildOfClass("Humanoid") then return true end
-        a = a.Parent
-    end
-    return false
+local function safe(fn, ...)
+    local ok, res = pcall(fn, ...)
+    return ok, res
 end
 
-local function protected(inst)
-    if not inst then return true end
-    if isIgnored(inst) then return true end
-    if CONFIG.PROTECT_PLAYERS and inst:IsDescendantOf(Players) then return true end
-    if CONFIG.PROTECT_NPCS_WITH_HUMANOID and ancestorHasHumanoid(inst) then return true end
-    if inst:IsDescendantOf(game:GetService("CoreGui")) then return true end
-    if LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui") and inst:IsDescendantOf(LocalPlayer.PlayerGui) then return true end
-    return false
-end
+-- Heuristics to decide whether to preserve an instance
+local function isWhitelisted(inst)
+    if not inst or not inst:IsA("Instance") then return false end
 
-local function ultraOptimize(inst)
-    if not inst or not inst.Parent then return end
-    if protected(inst) then return end
-
-    -- remove meshes/textures (non-destructive: blank ids)
-    if CONFIG.STRIP_MESHES and inst:IsA("SpecialMesh") then
-        pcall(function() inst.MeshId = "" end)
-    end
-    if CONFIG.STRIP_TEXTURES and inst:IsA("Decal") then
-        pcall(function() inst.Texture = "" end)
-    end
-    if CONFIG.FORCE_PLASTIC and inst:IsA("BasePart") then
-        pcall(function() inst.Material = Enum.Material.Plastic; inst.Reflectance = 0; inst.CastShadow = false end)
-    end
-    if inst:IsA("MeshPart") then
-        pcall(function() inst.MeshId = ""; inst.TextureID = ""; inst.RenderFidelity = Enum.RenderFidelity.Performance; inst.Material = Enum.Material.Plastic; inst.CastShadow = false end)
+    -- 1) Always preserve PlayerGui (game HUD / menus)
+    if inst:IsDescendantOf(player:FindFirstChild("PlayerGui") or {}) then
+        return true
     end
 
-    -- disable any particle/trail/explosion
-    if CONFIG.DISABLE_PARTICLES then
-        if inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles") then
-            pcall(function() inst.Enabled = false end)
-        elseif inst:IsA("Explosion") then
-            pcall(function() inst.BlastPressure = 0; inst.BlastRadius = 0; inst.Visible = false end)
+    -- 2) Preserve CoreGui-related (can't modify CoreGui safely)
+    -- (we don't try to modify CoreGui at all)
+
+    -- 3) Preserve player's character and descendants
+    if player.Character and inst:IsDescendantOf(player.Character) then
+        return true
+    end
+
+    -- 4) Preserve objects in ReplicatedStorage (assets), avoid touching
+    if inst:IsDescendantOf(ReplicatedStorage) then
+        return true
+    end
+
+    -- 5) Preserve obvious NPCs / enemies: Models that have Humanoid or HumanoidRootPart
+    local model = inst
+    while model and not model:IsA("Model") do
+        model = model.Parent
+    end
+    if model and model:IsA("Model") then
+        if model:FindFirstChildOfClass("Humanoid") or model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("PrimaryPart") then
+            return true
         end
     end
 
-    -- destroy non-critical post effects
-    if CONFIG.DISABLE_POST and inst:IsA("PostEffect") then
-        pcall(function() inst:Destroy() end)
+    -- 6) Preserve instances tagged via CollectionService "Keep" if present (devs sometimes tag important things)
+    if CollectionService and CollectionService:HasTag(inst, "Keep") then
+        return true
     end
 
-    -- clothing / appearances - remove to save drawcalls (but protect players/NPCs)
-    if inst:IsA("Clothing") or inst:IsA("SurfaceAppearance") or inst:IsA("BaseWrap") then
-        pcall(function() inst:Destroy() end)
+    -- 7) Preserve GUIs attached to world that look like essential: BillboardGui or SurfaceGui with Name containing "Quest" or "UI"
+    if inst:IsA("BillboardGui") or inst:IsA("SurfaceGui") then
+        local name = tostring(inst.Name):lower()
+        if name:find("quest") or name:find("ui") or name:find("hud") or name:find("health") then
+            return true
+        end
+    end
+
+    return false
+end
+
+-- Store backup for restorable props (best-effort)
+local function storeBackup(inst, key, value)
+    if not inst then return end
+    local id = tostring(inst:GetDebugId and inst:GetDebugId() or inst:GetFullName())
+    backup[id] = backup[id] or {instRef = inst}
+    backup[id][key] = value
+end
+
+-- Aggressive apply to a single instance (destructive where needed)
+local function applyAggressive(inst)
+    if not inst or not inst.Parent then return end
+    if isWhitelisted(inst) then return end
+
+    -- Decals / Textures / SurfaceAppearance -> destroy (irreversible)
+    if inst:IsA("Decal") or inst:IsA("Texture") then
+        safe(function()
+            storeBackup(inst, "exists", true)
+            inst:Destroy()
+        end)
+        return
+    end
+    if inst:IsA("SurfaceAppearance") then
+        safe(function()
+            storeBackup(inst, "exists", true)
+            inst:Destroy()
+        end)
+        return
+    end
+
+    -- Particle-type visuals -> disable
+    if inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") then
+        safe(function()
+            storeBackup(inst, "Enabled", inst.Enabled)
+            inst.Enabled = false
+        end)
+        return
+    end
+
+    -- SpecialMesh: try to remove texture ids / reduce complexity
+    if inst:IsA("SpecialMesh") then
+        safe(function()
+            storeBackup(inst, "MeshType", inst.MeshType)
+            storeBackup(inst, "MeshId", inst.MeshId)
+            storeBackup(inst, "TextureId", inst.TextureId)
+            -- remove texture to reduce draw (note: may change visuals)
+            inst.TextureId = ""
+            -- keep mesh type but could optionally set to FileMesh none; leave for safety
+        end)
+        return
+    end
+
+    -- MeshPart / UnionOperation: simplify by setting material & transparency
+    if inst:IsA("MeshPart") or inst:IsA("UnionOperation") or inst:IsA("Part") or inst:IsA("BasePart") then
+        safe(function()
+            -- skip parts in player's character
+            if player.Character and inst:IsDescendantOf(player.Character) then return end
+            -- backup
+            storeBackup(inst, "Material", inst.Material)
+            storeBackup(inst, "Color", inst.Color)
+            storeBackup(inst, "Transparency", inst.Transparency)
+            storeBackup(inst, "Reflectance", inst.Reflectance)
+            -- apply cheap look
+            inst.Material = Enum.Material.Plastic
+            inst.Color = Color3.fromRGB(128,128,128)
+            inst.Reflectance = 0
+            inst.Transparency = 0 -- keep visible for collision/hitbox
+        end)
+        return
+    end
+
+    -- Surface GUI / Billboard GUI that are not whitelisted: reduce adornments
+    if inst:IsA("BillboardGui") or inst:IsA("SurfaceGui") then
+        safe(function()
+            -- We try to hide heavy children (ImageLabel/ImageButton)
+            for _,c in ipairs(inst:GetDescendants()) do
+                if c:IsA("ImageLabel") or c:IsA("ImageButton") or c:IsA("VideoFrame") then
+                    pcall(function() c.Image = "" end)
+                    pcall(function() if c:IsA("GuiObject") then c.Visible = false end end)
+                end
+            end
+        end)
+        return
     end
 end
 
--- apply once
-for _,v in pairs(workspace:GetDescendants()) do pcall(ultraOptimize,v) end
-Workspace.DescendantAdded:Connect(function(v) task.wait(0.03); pcall(ultraOptimize,v) end)
-
--- global settings
-pcall(function()
-    settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
-    Lighting.GlobalShadows = false
-    Lighting.FogEnd = 1e9
-    Lighting.Brightness = math.max(Lighting.Brightness, 2.0)
-    Lighting.OutdoorAmbient = Color3.fromRGB(120,120,120)
-end)
-
--- terrain water
-pcall(function()
-    local t = workspace:FindFirstChildOfClass("Terrain")
-    if t then t.WaterWaveSize = 0; t.WaterWaveSpeed = 0; t.WaterReflectance = 0; t.WaterTransparency = 0; if sethiddenproperty then pcall(sethiddenproperty,t,"Decoration",false) end end
-end)
-
--- destroy MaterialService materials to fallback simple
-pcall(function()
-    for _,m in pairs(MaterialService:GetChildren()) do pcall(function() m:Destroy() end) end
-    pcall(function() MaterialService.Use2022Materials = false end)
-end)
-
--- setfpscap
-if CONFIG.LOCK_FPS and type(CONFIG.LOCK_FPS) == "number" and setfpscap then
-    pcall(function() setfpscap(CONFIG.LOCK_FPS) end)
+-- Batch processing (to avoid freeze)
+local function batchProcess(list, fn, batchSize, sleepTime)
+    batchSize = batchSize or BATCH_SIZE
+    sleepTime = sleepTime or SLEEP_TIME
+    local n = #list
+    local i = 1
+    while i <= n do
+        local to = math.min(n, i + batchSize - 1)
+        for j = i, to do
+            local inst = list[j]
+            fn(inst)
+        end
+        i = to + 1
+        task.wait(sleepTime)
+    end
 end
 
-notify("FixLag 100% applied — cực kỳ nhẹ. Nếu mất thứ cần thiết: put it into _G.Ignore và reconnect.", 8)
-print("DucLuongg FixLag100 loaded.")
+-- Lighting + rendering clamp
+local function clampLightingAndRender()
+    safe(function()
+        storeBackup(Lighting, "GlobalShadows", Lighting.GlobalShadows)
+        storeBackup(Lighting, "Brightness", Lighting.Brightness)
+        storeBackup(Lighting, "EnvironmentDiffuseScale", Lighting.EnvironmentDiffuseScale)
+        storeBackup(Lighting, "EnvironmentSpecularScale", Lighting.EnvironmentSpecularScale)
+        Lighting.GlobalShadows = false
+        Lighting.Brightness = 0.4
+        Lighting.EnvironmentDiffuseScale = 0
+        Lighting.EnvironmentSpecularScale = 0
+        Lighting.FogStart = 1e9
+        Lighting.FogEnd = 1e9
+    end)
+    safe(function()
+        if settings and settings().Rendering then
+            storeBackup(settings().Rendering, "QualityLevel", settings().Rendering.QualityLevel)
+            -- set to lowest allowed (may be blocked)
+            settings().Rendering.QualityLevel = 1
+        end
+    end)
+end
+
+-- apply to current workspace
+log("Starting Fix100 pass...")
+local all = Workspace:GetDescendants()
+batchProcess(all, applyAggressive)
+clampLightingAndRender()
+
+-- Keep effect on new objects (DescendantAdded)
+if _G.__fix100_conn then
+    pcall(function() _G.__fix100_conn:Disconnect() end)
+end
+_G.__fix100_conn = Workspace.DescendantAdded:Connect(function(inst)
+    -- tiny delay to let object initialize
+    task.wait(0.02)
+    if inst and inst.Parent then
+        pcall(function() applyAggressive(inst) end)
+    end
+end)
+
+-- Restore helper (best-effort). Note: destroyed Decal/Texture cannot be recovered by this restore.
+_G.__fix100_restore = function()
+    pcall(function()
+        if _G.__fix100_conn then
+            _G.__fix100_conn:Disconnect()
+            _G.__fix100_conn = nil
+        end
+        for id,info in pairs(backup) do
+            local inst = info.instRef
+            if inst and inst.Parent then
+                pcall(function()
+                    if info.Enabled ~= nil and inst:IsA("ParticleEmitter") then inst.Enabled = info.Enabled end
+                    if info.Material and inst:IsA("BasePart") then inst.Material = info.Material end
+                    if info.Color and inst:IsA("BasePart") then inst.Color = info.Color end
+                    if info.Transparency and inst:IsA("BasePart") then inst.Transparency = info.Transparency end
+                    if info.Reflectance and inst:IsA("BasePart") then inst.Reflectance = info.Reflectance end
+                    if info.MeshId and inst:IsA("SpecialMesh") then inst.MeshId = info.MeshId end
+                    if info.TextureId and inst:IsA("SpecialMesh") then inst.TextureId = info.TextureId end
+                    -- many destroyed decals/textures cannot be restored
+                end)
+            end
+        end
+        -- restore lighting
+        pcall(function()
+            if backup[tostring(Lighting)] and backup[tostring(Lighting)].Brightness then
+                Lighting.Brightness = backup[tostring(Lighting)].Brightness
+            end
+            if backup[tostring(Lighting)] and backup[tostring(Lighting)].GlobalShadows ~= nil then
+                Lighting.GlobalShadows = backup[tostring(Lighting)].GlobalShadows
+            end
+            if settings and settings().Rendering and backup[ tostring(settings().Rendering) ] and backup[ tostring(settings().Rendering) ].QualityLevel then
+                settings().Rendering.QualityLevel = backup[ tostring(settings().Rendering) ].QualityLevel
+            end
+        end)
+    end)
+    log("Restore attempted (best-effort). Note: destroyed decals/textures cannot be recovered.")
+end
+
+log("Fix100 applied. To attempt restore, call: _G.__fix100_restore()")
